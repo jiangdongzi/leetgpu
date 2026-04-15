@@ -18,4 +18,13 @@ def solve(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, n: int) -> None:
         return
     block_size = 1024
     grid = (triton.cdiv(n, block_size),)
+    print(f"Launching kernel with grid={grid} and block_size={block_size}")
     vector_add_kernel[grid](a, b, c, n, BLOCK_SIZE=block_size)
+
+if __name__ == "__main__":
+    n = 10000000
+    a = torch.randn(n, device='cuda')
+    b = torch.randn(n, device='cuda')
+    c = torch.empty_like(a)
+    solve(a, b, c, n)
+    assert torch.allclose(c, a + b)
