@@ -1,92 +1,44 @@
-import triton.language as tl
 import torch
 import triton
+import triton.language as tl
 
 @triton.jit
-def matrix_multiplication_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_an,
-    stride_bn, stride_bk,
-    stride_cm, stride_ck,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr
-):
+def invert_kernel(image, width, height, BLOCK_SIZE: tl.constexpr):
+    n_pixels = width * height
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_k
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    local_pid_num = pid % num_pid_in_group
-    pid_m = first_pid_m + local_pid_num % group_size_m
-    pid_k = local_pid_num // group_size_m
+    start_idx = pid * BLOCK_SIZE * 4
+    offs = tl.arange(0, BLOCK_SIZE) * 4
+    ir = start_idx + offs + image
+    ig = start_idx + offs + 1 + image
+    ib = start_idx + offs + 2 + image
+    r = tl.load(ir, mask=(ir < n_pixels))
+    g = tl.load(ig, mask=(ig < n_pixels))
+    b = tl.load(ib, mask=(ib < n_pixels))
+    r = 255 - r
+    g = 255 - g
+    b = 255 - b
 
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
-
-    msk_m = offs_m < M
-    msk_k = offs_k < K
-
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
-
-    aptrs = offs_m[:, None] * stride_am + offs_n[None, :] * stride_an + a_ptr
-    bptrs = offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk + b_ptr
-
-    for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        offs_n_curr = n * BLOCK_SIZE_N + offs_n
-        msk_n = offs_n_curr < N
-
-        a = tl.load(aptrs, msk_m[:, None] & msk_n[None, :], other=0.0)
-        b = tl.load(bptrs, msk_n[:, None] & msk_k[None, :], other=0.0)
-        acc += tl.dot(a, b)
-        aptrs += BLOCK_SIZE_N * stride_an
-        bptrs += BLOCK_SIZE_N * stride_bn
+    tl.store(ir, r, mask=(ir < n_pixels))
+    tl.store(ig, g, mask=(ig < n_pixels))
+    tl.store(ib, b, mask=(ib < n_pixels))
     pass
 
-def solve(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, M: int, N: int, K: int):
-    stride_am, stride_an = a.stride()
-    stride_bn, stride_bk = b.stride()
-    stride_cm, stride_ck = c.stride()
+# image is a tensor on the GPU
+def solve(image: torch.Tensor, width: int, height: int):
+    BLOCK_SIZE = 1024
+    n_pixels = width * height
+    # 计算需要的 grid 数量，cdiv 向上取整以覆盖所有像素
+    grid = (triton.cdiv(n_pixels, BLOCK_SIZE),)
 
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_K = 128
-    BLOCK_SIZE_N = 32
-    GROUP_SIZE_M = 8
-
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(K, META['BLOCK_SIZE_K']),
-    )
-
-    matrix_multiplication_kernel[grid](
-        a, b, c, 
-        M, N, K, 
-        stride_am, stride_an, 
-        stride_bn, stride_bk, 
-        stride_cm, stride_ck,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        GROUP_SIZE_M=GROUP_SIZE_M
-    )
+    invert_kernel[grid](image, width, height, BLOCK_SIZE)
 
 if __name__ == "__main__":
-    # 测试代码
-    M, N, K = 512, 512, 512
-    a = torch.randn(M, N, device='cuda')
-    b = torch.randn(N, K, device='cuda')
-    c = torch.zeros(M, K, device='cuda')
+    # Example usage
+    width, height = 1024, 1024
+    image = torch.randint(0, 256, (height, width, 4), dtype=torch.uint8, device='cuda')
 
-    solve(a, b, c, M, N, K)
+    solve(image, width, height)
 
-    # 验证结果
-    print ("验证结果...")
-    #print c, a @ b
-    print(torch.allclose(c, a @ b, atol=1e-1))
-    assert torch.allclose(c, a @ b, atol=1e-1), "结果不正确！"
-
-    print("测试通过！")
+    # Verify correctness
+    expected = 255 - image
+    assert torch.allclose(image[..., :3], expected[..., :3]), "Color inversion failed!"
