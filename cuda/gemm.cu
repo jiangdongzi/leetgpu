@@ -1,69 +1,129 @@
 #include <cuda_runtime.h>
+# define WARP_SIZE 32
+#define FLOAT4(value) (reinterpret_cast<float4*>(&(value))[0])
+template<int Bm = 128, int Bn = 128, int Bk=8, int blockSize = 256, int A_BLOCK_X=8,
+int B_BLOCK_X = 32, int C_BLOCK_X=16, int C_WARP_X = 8, int C_WARP_Y = 4>
+__global__ void matrix_multiplication_kernel(const float* A, const float* B, float* C, int M, int K,
+                                             int N) 
+{
+    __shared__ float As[Bk][Bm];
+    __shared__ float Bs[Bk][Bn];
 
-// 定义 Tile 的大小，需要与 host 代码中的 threadsPerBlock 匹配
-#define TILE_SIZE 16
+    // 需要计算的c 的tile 块的左上角
+    int r0 = blockIdx.y*Bm; 
+    int c0 = blockIdx.x*Bn;
+    int tid = threadIdx.x;
 
-__global__ void matrix_multiplication_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
-    // 1. 计算当前线程负责的全局行号和列号
-    // blockIdx.y 对应行 (M)，blockIdx.x 对应列 (K)
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    //*----tileA-----*
+    constexpr int A_BLOCK_Y = blockSize / A_BLOCK_X; // (8, 32)
 
-    // 2. 声明共享内存（__shared__ 变量存储在每个 Block 的片上内存中，速度非常快）
-    __shared__ float s_A[TILE_SIZE][TILE_SIZE];
-    __shared__ float s_B[TILE_SIZE][TILE_SIZE];
+    int A_THREAD_Y = tid / A_BLOCK_X;
+    int A_THREAD_X = tid % A_BLOCK_X;
 
-    // 用于累加当前线程负责的 C[row][col] 的点积结果
-    float value = 0.0f;
+    //*----tileB-----*
+    constexpr int B_BLOCK_Y = blockSize / B_BLOCK_X; // (32, 8)
 
-    // 3. 遍历所有需要的 Tile 分块来计算完整的点积
-    // 矩阵 A 宽度为 N，矩阵 B 高度为 N，所以共需要向上取整 (N / TILE_SIZE) 个阶段
-    int numTiles = (N + TILE_SIZE - 1) / TILE_SIZE;
+    int B_THREAD_Y = tid / B_BLOCK_X;
+    int B_THREAD_X = tid % B_BLOCK_X;
+
+    //*----tileC-----*
+    constexpr int C_BLOCK_Y = blockSize / C_BLOCK_X; //(16, 16)
     
-    for (int ph = 0; ph < numTiles; ++ph) {
-        
-        // 4. 协作加载矩阵 A 的当前 Tile 到共享内存
-        // 边界检查：如果行索引超出 M 或列索引（在此阶段中）超出 N，则补 0
-        if (row < M && (ph * TILE_SIZE + threadIdx.x) < N) {
-            s_A[threadIdx.y][threadIdx.x] = A[row * N + (ph * TILE_SIZE + threadIdx.x)];
-        } else {
-            s_A[threadIdx.y][threadIdx.x] = 0.0f;
+    // 按照 8*4 排列 warp
+    // int C_THREAD_Y = tid / C_BLOCK_X;
+    // int C_THREAD_X = tid % C_BLOCK_X;
+
+    // 计算当前 thread 在warp中 的 x,y 坐标
+    int warpId = tid / WARP_SIZE;
+    int laneId = tid % WARP_SIZE;
+
+    //计算总共有几行几列warp
+    constexpr int C_WARP_DIM_X = C_BLOCK_X / C_WARP_X; // 16/8=2
+    
+    // 计算 thread 在所在 warp 中 在block中的x, y 坐标
+    int warpX = warpId % C_WARP_DIM_X; 
+    int warpY = warpId / C_WARP_DIM_X;
+
+    //计算thread在warp中的x, y坐标
+    // int laneY = laneId / C_WARP_X;
+    // int laneX = laneId % C_WARP_X;
+
+    // z-order 排布
+    int laneY = laneId % 2 + laneId /16 * 2;
+    int laneX = laneId % 16 / 2;
+
+    // 当前thread 在 blockC中的行列坐标 (warpY * C_WARP_Y + laneY, warpX * C_WARP_X + laneX)
+    int C_THREAD_Y = warpY * C_WARP_Y + laneY;
+    int C_THREAD_X = warpX * C_WARP_X + laneX;
+
+    // 每个thread 负责 Tm*TN 个元素计算
+    constexpr int Tm = Bm / C_BLOCK_Y;
+    constexpr int Tn = Bn / C_BLOCK_X;
+    float Ct[Tm][Tn] = {0.0f};
+    float regA[Tm] = {0.0f};
+    float regB[Tn] = {0.0f};
+    for(int k = 0; k < K; k += Bk){
+        // read global Mem into shared Mem,行方向stride为 A_BLOCK_Y 列方向 stride为 A_BLOCK_X
+        for(int i = A_THREAD_Y; i<Bm; i += A_BLOCK_Y){
+            int r = r0 + i;
+            for(int j = A_THREAD_X; j<Bk; j+= A_BLOCK_X){
+                int c = k + j;
+                As[j][i^(j << 2)] = (r<M && c <K)?A[r * K + c] : 0.f;
+            }
         }
 
-        // 5. 协作加载矩阵 B 的当前 Tile 到共享内存
-        // 边界检查：如果行索引（在此阶段中）超出 N 或列索引超出 K，则补 0
-        if ((ph * TILE_SIZE + threadIdx.y) < N && col < K) {
-            s_B[threadIdx.y][threadIdx.x] = B[(ph * TILE_SIZE + threadIdx.y) * K + col];
-        } else {
-            s_B[threadIdx.y][threadIdx.x] = 0.0f;
+        // read global Mem into shared Mem, 行方向 stride 为 B_BLOCK_Y 列方向 stride为 B_BLOCK_X
+        for(int i = B_THREAD_Y; i<Bk; i += B_BLOCK_Y){
+            int r = k + i;
+            for(int j = B_THREAD_X; j<Bn; j+= B_BLOCK_X){
+                int c = c0 + j;
+                Bs[i][j] = (r < K && c <N) ? B[r*N + c]: 0.f;
+            } 
         }
 
-        // 6. 同步线程，确保当前 Block 内所有线程都已经完成了共享内存的加载
         __syncthreads();
 
-        // 7. 对当前加载到共享内存中的 Tile 进行子矩阵乘法，并累加到 value 中
-        for (int i = 0; i < TILE_SIZE; ++i) {
-            value += s_A[threadIdx.y][i] * s_B[i][threadIdx.x];
-        }
+        // 计算tileA * tileB
+        // 先循环 k 维度 计算外积
+        for(int p=0; p<Bk; p++){
+            // 存储 A 中列向量到 regA
+            for(int i=0; i<Tm/4; i++){
+                int r = (C_THREAD_Y + i * C_BLOCK_Y)*4;
+                FLOAT4(regA[i*4]) = FLOAT4(As[p][r ^ (p<<2)]);
+            }
 
-        // 8. 再次同步线程，确保在进入下一个阶段覆盖共享内存之前，所有线程都已经完成了计算
+            for(int i=0; i<Tn/4; i++){
+                int c = (C_THREAD_X + i * C_BLOCK_X)*4;
+                FLOAT4(regB[i*4]) = FLOAT4(Bs[p][c]); 
+            }
+
+            for(int i=0; i<Tm; i++){
+                for(int j=0; j<Tn; j++){
+                    Ct[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
         __syncthreads();
     }
 
-    // 9. 将最终结果写回全局内存的 C 矩阵中，并进行边界检查
-    if (row < M && col < K) {
-        C[row * K + col] = value;
+    for(int i = 0; i < Tm; i++){
+        int r  = r0 + 4 * C_THREAD_Y + i/4 * 4 * C_BLOCK_Y + i % 4;
+        for(int j = 0; j < Tn; j++){
+            int c = c0 + 4 * C_THREAD_X + j/4 * 4 * C_BLOCK_X + j % 4;
+            if(r < M && c < N) {C[r * N + c] = Ct[i][j];}
+        }
     }
+
 }
 
-extern "C" void solve(const float* A, const float* B, float* C, int M, int N, int K) {
-    // 启动配置，16x16 线程块
-    dim3 threadsPerBlock(TILE_SIZE, TILE_SIZE);
-    
-    // 计算 Grid 大小，注意 x 对应 K (列)，y 对应 M (行)
-    dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                       (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
+// A, B, C are device pointers (i.e. pointers to memory on the GPU)
+extern "C" void solve(const float* A, const float* B, float* C, int M, int K, int N) {
+    dim3 threadsPerBlock(256);
+    int BN = 128;
+    int BM = 128;
+    dim3 blocksPerGrid((N + BN - 1) / BN,
+                       (M + BM - 1) / BM);
 
-    matrix_multiplication_kernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K);
+    matrix_multiplication_kernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, K, N);
     cudaDeviceSynchronize();
 }
