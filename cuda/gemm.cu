@@ -1,4 +1,12 @@
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <random>
+#include <tuple>
 
 // ============================================================================
 // 高性能 SGEMM (Single-precision GEMM) kernel
@@ -234,18 +242,199 @@ __global__ void matrix_multiplication_kernel(const float* A, const float* B, flo
 }
 
 // A, B, C are device pointers (i.e. pointers to memory on the GPU)
-//
-// ⚠ 注意:下面调用 kernel 时把 (M, N, K) 传成了 (M, K, N),且 grid.x 用了 K。
-//   只有当外部传入的 N == K(或者非方阵但凑巧)时结果才正确;
-//   一般情况下应改为:
-//     dim3 blocksPerGrid((N + BLOCK_N - 1) / BLOCK_N,
-//                        (M + BLOCK_M - 1) / BLOCK_M);
-//     matrix_multiplication_kernel<<<...>>>(A, B, C, M, N, K);
+// 形状: A[M, K], B[K, N], C[M, N] (行主序)
 extern "C" void solve(const float* A, const float* B, float* C, int M, int N, int K) {
     dim3 threadsPerBlock(BLOCK_SIZE);
-    dim3 blocksPerGrid((K + BLOCK_N - 1) / BLOCK_N,
+    dim3 blocksPerGrid((N + BLOCK_N - 1) / BLOCK_N,
                        (M + BLOCK_M - 1) / BLOCK_M);
-    
-    matrix_multiplication_kernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, K, N);
+
+    matrix_multiplication_kernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K);
     cudaDeviceSynchronize();
+}
+
+// ============================================================================
+//                       压测 (Benchmark) 代码
+// ============================================================================
+
+#define CUDA_CHECK(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) { \
+    fprintf(stderr, "CUDA Error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_e)); \
+    std::exit(1); } } while (0)
+
+#define CUBLAS_CHECK(x) do { cublasStatus_t _s = (x); if (_s != CUBLAS_STATUS_SUCCESS) { \
+    fprintf(stderr, "cuBLAS Error %s:%d: status=%d\n", __FILE__, __LINE__, (int)_s); \
+    std::exit(1); } } while (0)
+
+// 不带 device sync 的 launcher,方便用 cudaEvent 计时
+static inline void launch_ours(const float* A, const float* B, float* C,
+                               int M, int N, int K) {
+    dim3 block(BLOCK_SIZE);
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N,
+              (M + BLOCK_M - 1) / BLOCK_M);
+    matrix_multiplication_kernel<<<grid, block>>>(A, B, C, M, N, K);
+}
+
+// 用 cuBLAS 计算行主序的 C(M,N) = A(M,K) * B(K,N)
+// cuBLAS 是列主序: 把行主序数据当列主序看,即看到的是各矩阵的转置。
+//   令 C^T = B^T * A^T (列主序视角即可直接得到行主序的 C),
+//   对应调用: m=N, n=M, k=K, A_blas=B(ldb=N), B_blas=A(lda=K), C_blas=C(ldc=N)
+static inline void launch_cublas(cublasHandle_t handle,
+                                 const float* A, const float* B, float* C,
+                                 int M, int N, int K) {
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(handle,
+                             CUBLAS_OP_N, CUBLAS_OP_N,
+                             N, M, K,
+                             &alpha,
+                             B, N,
+                             A, K,
+                             &beta,
+                             C, N));
+}
+
+struct BenchResult {
+    float ms;
+    double tflops;
+};
+
+template <typename Fn>
+static BenchResult time_kernel(Fn&& fn, double flops, int warmup, int iters) {
+    cudaEvent_t s, e;
+    CUDA_CHECK(cudaEventCreate(&s));
+    CUDA_CHECK(cudaEventCreate(&e));
+
+    for (int i = 0; i < warmup; ++i) fn();
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int i = 0; i < iters; ++i) fn();
+    CUDA_CHECK(cudaEventRecord(e));
+    CUDA_CHECK(cudaEventSynchronize(e));
+
+    float ms_total = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms_total, s, e));
+    cudaEventDestroy(s);
+    cudaEventDestroy(e);
+
+    BenchResult r;
+    r.ms = ms_total / iters;
+    r.tflops = flops / (r.ms * 1e9);  // 2*M*N*K / (ms * 1e9) == TFLOPS
+    return r;
+}
+
+static void print_device_info() {
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    cudaDeviceProp p{};
+    CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
+    printf("================ Device Info ================\n");
+    printf("  Device         : %s\n", p.name);
+    printf("  Compute Cap.   : sm_%d%d\n", p.major, p.minor);
+    printf("  SMs            : %d\n", p.multiProcessorCount);
+    printf("  Max Threads/SM : %d\n", p.maxThreadsPerMultiProcessor);
+    printf("  Shared/Block   : %zu KB\n", p.sharedMemPerBlock / 1024);
+    printf("  Global Mem     : %.2f GB\n", p.totalGlobalMem / (1024.0 * 1024 * 1024));
+    printf("  Mem Bus        : %d-bit @ %.0f MHz (peak %.1f GB/s)\n",
+           p.memoryBusWidth, p.memoryClockRate / 1e3,
+           2.0 * p.memoryClockRate * (p.memoryBusWidth / 8) / 1e6);
+    printf("=============================================\n\n");
+}
+
+int main() {
+    print_device_info();
+
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    // 测试形状: 含方阵 + 长方阵 + 非 128 倍数的边界情况
+    std::vector<std::tuple<int,int,int>> shapes = {
+        {  256,   256,   256},
+        {  512,   512,   512},
+        { 1024,  1024,  1024},
+        { 2048,  2048,  2048},
+        { 4096,  4096,  4096},
+        { 8192,  8192,  8192},
+        // 非方阵
+        { 1024,  4096,  1024},
+        { 4096,  1024,  4096},
+        { 4096,  4096,  1024},
+        { 1024,  1024,  8192},
+        { 3072,  3072,   768},
+        // 非 BLOCK_M/N 倍数(测试边界处理)
+        { 1000,  1000,  1000},
+        { 4097,  4097,  4097},
+    };
+
+    printf("%-22s | %11s | %11s | %10s | %10s | %7s | %10s | %9s\n",
+           "Shape (M, N, K)", "Ours (ms)", "cuBLAS (ms)",
+           "Ours TF/s", "cuBLAS TF/s", "Ratio", "max|err|", "rel_F");
+    printf("-----------------------+-------------+-------------+------------+------------+---------+------------+----------\n");
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    for (auto& shp : shapes) {
+        int M = std::get<0>(shp), N = std::get<1>(shp), K = std::get<2>(shp);
+
+        size_t szA = (size_t)M * K;
+        size_t szB = (size_t)K * N;
+        size_t szC = (size_t)M * N;
+
+        std::vector<float> hA(szA), hB(szB), hC(szC), hRef(szC);
+        for (auto& x : hA) x = dist(rng);
+        for (auto& x : hB) x = dist(rng);
+
+        float *dA = nullptr, *dB = nullptr, *dC = nullptr, *dRef = nullptr;
+        CUDA_CHECK(cudaMalloc(&dA,   szA * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dB,   szB * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dC,   szC * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dRef, szC * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(dA, hA.data(), szA * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dB, hB.data(), szB * sizeof(float), cudaMemcpyHostToDevice));
+
+        // ===== 正确性验证 (与 cuBLAS 比较) =====
+        launch_ours(dA, dB, dC, M, N, K);
+        launch_cublas(handle, dA, dB, dRef, M, N, K);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(hC.data(),   dC,   szC * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hRef.data(), dRef, szC * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // Frobenius 相对误差: ||C - Cref||_F / ||Cref||_F
+        // 这是 BLAS 实现间比较的标准做法,逐元素相对误差对接近 0 的元素会过敏(误报)
+        double max_abs_err = 0.0, sum_diff2 = 0.0, sum_ref2 = 0.0;
+        for (size_t i = 0; i < szC; ++i) {
+            double d = (double)hC[i] - (double)hRef[i];
+            double r = (double)hRef[i];
+            sum_diff2 += d * d;
+            sum_ref2  += r * r;
+            double ae = std::fabs(d);
+            if (ae > max_abs_err) max_abs_err = ae;
+        }
+        double frob_rel = std::sqrt(sum_diff2 / (sum_ref2 + 1e-30));
+
+        // ===== 计时 =====
+        // 小矩阵跑多一些迭代,大矩阵少一点避免太慢
+        double flops = 2.0 * M * N * K;
+        int iters = (M >= 4096 || N >= 4096) ? 20 : 50;
+
+        BenchResult ro = time_kernel(
+            [&]() { launch_ours(dA, dB, dC, M, N, K); }, flops, 5, iters);
+        BenchResult rb = time_kernel(
+            [&]() { launch_cublas(handle, dA, dB, dRef, M, N, K); }, flops, 5, iters);
+
+        char shape_str[40];
+        std::snprintf(shape_str, sizeof(shape_str), "(%d, %d, %d)", M, N, K);
+        double ratio = ro.tflops / rb.tflops * 100.0;
+        // FP32 SGEMM 在大规模下,Frobenius 相对误差 ~ sqrt(K) * eps_fp32 ≈ 1e-4 量级是正常的
+        const char* mark = (frob_rel < 1e-3) ? " OK" : " !!";
+        printf("%-22s | %9.3f   | %9.3f   | %8.2f   | %8.2f   | %5.1f%%  | %.3e  | %.2e%s\n",
+               shape_str, ro.ms, rb.ms, ro.tflops, rb.tflops, ratio,
+               max_abs_err, frob_rel, mark);
+        fflush(stdout);
+
+        cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dRef);
+    }
+
+    cublasDestroy(handle);
+    printf("\nDone.\n");
+    return 0;
 }
