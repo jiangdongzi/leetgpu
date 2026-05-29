@@ -112,7 +112,7 @@ extern "C" void solve(const float* x, float* output, int N) {
     cudaMalloc(&output_sum, 4 * blocks);
     block_reduce_online<<<blocks, threads>>>(x, N, output_max, output_sum);
     scan_block(output_max, output_sum, blocks);
-    normalize_kernel<<<blocks, threads>>>(x, output, N);
+    normalize_kernel<<<1024, threads>>>(x, output, N);
     cudaFree(output_max);
     cudaFree(output_sum);
 }
