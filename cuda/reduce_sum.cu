@@ -29,9 +29,9 @@ __inline__ __device__ float blockReduceSum(float val) {
 
     // 3. 由第一个 Warp 读取 Shared Memory 并进行最终规约
     // 只有 blockDim.x / warpSize 个有效数据
-    val = (threadIdx.x < (blockDim.x / warpSize)) ? shared[lane] : 0.0f;
 
     if (wid == 0) {
+        val = (threadIdx.x < (blockDim.x / warpSize)) ? shared[lane] : 0.0f;
         val = warpReduceSum(val);
     }
     
@@ -61,7 +61,7 @@ extern "C" void solve(const float* input, float* output, int N) {
     // 确保 output 初始化为 0，因为我们要使用 atomicAdd
     cudaMemset(output, 0, sizeof(float));
 
-    int threads = 256;
+    int threads = 1024;
     // 限制 block 数量，确保每个线程能处理多个元素，隐藏访存延迟
     // 对于 T4/A100 等 GPU，1024 到 4096 都是不错的 Grid 尺寸
     int blocks = 1024; 

@@ -2,6 +2,9 @@
 #include <cuda_runtime.h>
 #include <float.h>
 #include <math.h>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 namespace {
 
@@ -147,4 +150,109 @@ extern "C" void solve(const float* x, float* output, int N) {
     reduce_blocks_kernel<<<blocks, kThreadsPerBlock>>>(x, N);
     reduce_global_kernel<<<1, kThreadsPerBlock>>>(blocks);
     normalize_kernel<<<blocks, kThreadsPerBlock>>>(x, output, N);
+}
+
+namespace {
+
+// CPU 参考实现：数值稳定的 softmax。
+void softmax_reference(const std::vector<float>& x, std::vector<float>& out) {
+    const int n = static_cast<int>(x.size());
+    float max_val = -FLT_MAX;
+    for (int i = 0; i < n; ++i) {
+        max_val = std::max(max_val, x[i]);
+    }
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += std::exp(static_cast<double>(x[i] - max_val));
+    }
+    for (int i = 0; i < n; ++i) {
+        out[i] = static_cast<float>(std::exp(static_cast<double>(x[i] - max_val)) / sum);
+    }
+}
+
+// 跑一个测试用例：在 GPU 上调用 solve，并与 CPU 参考结果对比。
+bool run_case(const char* name, const std::vector<float>& host_x) {
+    const int n = static_cast<int>(host_x.size());
+
+    float* d_x = nullptr;
+    float* d_out = nullptr;
+    cudaMalloc(&d_x, n * sizeof(float));
+    cudaMalloc(&d_out, n * sizeof(float));
+    cudaMemcpy(d_x, host_x.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    solve(d_x, d_out, n);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("[FAIL] %-18s CUDA error: %s\n", name, cudaGetErrorString(err));
+        cudaFree(d_x);
+        cudaFree(d_out);
+        return false;
+    }
+
+    std::vector<float> gpu_out(n);
+    cudaMemcpy(gpu_out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    std::vector<float> ref_out(n);
+    softmax_reference(host_x, ref_out);
+
+    float max_abs_err = 0.0f;
+    double gpu_sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        max_abs_err = std::max(max_abs_err, std::fabs(gpu_out[i] - ref_out[i]));
+        gpu_sum += gpu_out[i];
+    }
+
+    cudaFree(d_x);
+    cudaFree(d_out);
+
+    const float tol = 1e-5f;
+    const bool ok = max_abs_err <= tol;
+    printf("[%s] %-18s N=%-8d max_abs_err=%.3e  sum=%.6f\n",
+           ok ? "PASS" : "FAIL", name, n, max_abs_err, gpu_sum);
+    return ok;
+}
+
+} // namespace
+
+int main() {
+    srand(123);
+
+    bool all_ok = true;
+
+    // 1. 小规模、手工可推。
+    all_ok &= run_case("small", {1.0f, 2.0f, 3.0f, 4.0f});
+
+    // 2. 全相等输入：结果应为均匀分布 1/N。
+    all_ok &= run_case("uniform", std::vector<float>(1000, 5.0f));
+
+    // 3. 含很大值，检验数值稳定性（不会 inf/nan）。
+    all_ok &= run_case("large-values",
+                       {1000.0f, 1001.0f, 999.0f, 1000.5f, 998.5f});
+
+    // 4. 含负数和正数混合。
+    all_ok &= run_case("mixed", {-3.0f, -1.0f, 0.0f, 2.0f, 5.0f, -10.0f});
+
+    // 5. 单元素。
+    all_ok &= run_case("single", {42.0f});
+
+    // 6. 大规模随机，跨多个 block，验证 grid-stride + 多 pass 归约。
+    {
+        std::vector<float> big(1 << 20);
+        for (auto& v : big) {
+            v = (static_cast<float>(rand()) / RAND_MAX) * 20.0f - 10.0f;
+        }
+        all_ok &= run_case("large-random", big);
+    }
+
+    // 7. 超大规模，元素数远超 kMaxBlocks * kThreadsPerBlock，验证 grid-stride 覆盖。
+    {
+        std::vector<float> huge(5 * 1000 * 1000);
+        for (auto& v : huge) {
+            v = (static_cast<float>(rand()) / RAND_MAX) * 6.0f - 3.0f;
+        }
+        all_ok &= run_case("huge-random", huge);
+    }
+
+    printf("\n%s\n", all_ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
+    return all_ok ? 0 : 1;
 }
