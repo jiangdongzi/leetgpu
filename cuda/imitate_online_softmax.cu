@@ -7,12 +7,13 @@
 #include <vector>
 
 
-__inline__ __device__ float warp_reduce_online(float& max_val, float& sum_val) {
+__inline__ __device__ void warp_reduce_online(float& max_val, float& sum_val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         float other_max = __shfl_down_sync(0xffffffff, max_val, offset);
         float other_sum = __shfl_down_sync(0xffffffff, sum_val, offset);
         const float tmp_max = fmaxf(other_max, max_val);
         sum_val = sum_val * expf(max_val - tmp_max) + other_sum * expf(other_max - max_val);
+        max_val = tmp_max;
     }
 }
 
@@ -30,8 +31,8 @@ __global__ void block_reduce_online(const float * const input, const int N, floa
     static __shared__ float smem_max[32];
     static __shared__ float smem_sum[32];
     if (lane_id == 0) {
-        smem_max[lane_id] = max_val; 
-        smem_sum[lane_id] = sum_val; 
+        smem_max[warp_id] = max_val; 
+        smem_sum[warp_id] = sum_val; 
     }
     __syncthreads();
     if (warp_id == 0) {
@@ -48,7 +49,7 @@ __global__ void block_reduce_online(const float * const input, const int N, floa
 __global__ void block_reduce_online(const float * const input_max, const float* const input_sum, const int N, float* output_max, float* output_sum) {
     const int lane_id = threadIdx.x;
     const int warp_id = threadIdx.y;
-    const int gtid = 1024 * blockIdx.x;
+    const int gtid = 1024 * blockIdx.x + warp_id * 32 + lane_id;
     float max_val = -2e38f;
     float sum_val = 0.f;
     if (gtid < N) {
@@ -111,7 +112,9 @@ extern "C" void solve(const float* x, float* output, int N) {
     cudaMalloc(&output_sum, 4 * blocks);
     block_reduce_online<<<blocks, threads>>>(x, N, output_max, output_sum);
     scan_block(output_max, output_sum, blocks);
-    //free
+    normalize_kernel<<<blocks, threads>>>(x, output, N);
+    cudaFree(output_max);
+    cudaFree(output_sum);
 }
 
 static void cpu_softmax(const std::vector<float>& x, std::vector<float>& ref) {
