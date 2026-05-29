@@ -12,7 +12,7 @@ __inline__ __device__ void warp_reduce_online(float& max_val, float& sum_val) {
         float other_max = __shfl_down_sync(0xffffffff, max_val, offset);
         float other_sum = __shfl_down_sync(0xffffffff, sum_val, offset);
         const float tmp_max = fmaxf(other_max, max_val);
-        sum_val = sum_val * expf(max_val - tmp_max) + other_sum * expf(other_max - max_val);
+        sum_val = sum_val * expf(max_val - tmp_max) + other_sum * expf(other_max - tmp_max);
         max_val = tmp_max;
     }
 }
@@ -60,8 +60,8 @@ __global__ void block_reduce_online(const float * const input_max, const float* 
     static __shared__ float smem_max[32];
     static __shared__ float smem_sum[32];
     if (lane_id == 0) {
-        smem_max[lane_id] = max_val; 
-        smem_sum[lane_id] = sum_val; 
+        smem_max[warp_id] = max_val; 
+        smem_sum[warp_id] = sum_val; 
     }
     __syncthreads();
     if (warp_id == 0) {
@@ -86,12 +86,13 @@ void scan_block(const float* input_max, const float* input_sum, const int N) {
     cudaMalloc(&output_sum, 4 * blocks);
     block_reduce_online<<<blocks, threads>>>(input_max, input_sum, N, output_max, output_sum);
     if (blocks == 1) {
-        global_max = output_max[0];
-        global_sum = output_sum[0];
+        cudaMemcpyToSymbol(global_max, output_max, sizeof(float), 0, cudaMemcpyDeviceToDevice);
+        cudaMemcpyToSymbol(global_sum, output_sum, sizeof(float), 0, cudaMemcpyDeviceToDevice);
     } else {
         scan_block(output_max, output_sum, blocks);
     }
-    //free mem
+    cudaFree(output_max);
+    cudaFree(output_sum);
 }
 
 __global__ void normalize_kernel(const float* x, float* output, int N) {
@@ -112,7 +113,7 @@ extern "C" void solve(const float* x, float* output, int N) {
     cudaMalloc(&output_sum, 4 * blocks);
     block_reduce_online<<<blocks, threads>>>(x, N, output_max, output_sum);
     scan_block(output_max, output_sum, blocks);
-    normalize_kernel<<<1024, threads>>>(x, output, N);
+    normalize_kernel<<<blocks, 1024>>>(x, output, N);
     cudaFree(output_max);
     cudaFree(output_sum);
 }
