@@ -74,7 +74,7 @@ __global__ void block_reduce_online(const float * const input_max, const float* 
     }
 }
 
-float global_max, global_sum;
+__device__ float global_max, global_sum;
 
 void scan_block(const float* input_max, const float* input_sum, const int N) {
     dim3 threads(32, 32);
