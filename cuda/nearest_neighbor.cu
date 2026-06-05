@@ -1,92 +1,56 @@
 #include <cuda_runtime.h>
 #include <float.h>
 
-#define BLOCK_SIZE 256
+// 每个 block 算一个 query 点 i 的最近邻
+// blockDim.x 个线程协作扫描所有 N 个候选点，做 block 内归约
+__global__ void nearest(const float* points, int* indices, int N) {
+    int i = blockIdx.x;          // 当前 query 点
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
 
-// CUDA Kernel
-__global__ void nearestNeighborKernel(const float* __restrict__ points, int* __restrict__ indices, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int tx = threadIdx.x;
+    // 把 query 点坐标读进寄存器（一次，复用 N 次）
+    float xi = points[3 * i + 0];
+    float yi = points[3 * i + 1];
+    float zi = points[3 * i + 2];
 
-    // 1. 将当前线程负责的目标点加载到寄存器中 (Register)
-    float target_x, target_y, target_z;
-    if (idx < N) {
-        target_x = points[idx * 3];
-        target_y = points[idx * 3 + 1];
-        target_z = points[idx * 3 + 2];
+    float bestDist = FLT_MAX;
+    int   bestIdx  = -1;
+
+    // grid-stride 扫描所有候选点 j
+    for (int j = tid; j < N; j += nt) {
+        if (j == i) continue;    // 排除自己
+        float dx = points[3 * j + 0] - xi;
+        float dy = points[3 * j + 1] - yi;
+        float dz = points[3 * j + 2] - zi;
+        float d = dx * dx + dy * dy + dz * dz;   // 平方距离，无需开方
+        if (d < bestDist) { bestDist = d; bestIdx = j; }
     }
 
-    float min_dist = FLT_MAX;
-    int best_idx = -1;
+    // block 内归约：找全局最小，平局取更小的 index
+    __shared__ float sDist[256];
+    __shared__ int   sIdx[256];
+    sDist[tid] = bestDist;
+    sIdx[tid]  = bestIdx;
+    __syncthreads();
 
-    // 2. 声明共享内存 (Shared Memory)
-    // 技巧：这里在共享内存中将全局内存的 AoS (Array of Structures) 转为 SoA (Structure of Arrays)
-    // 这样做可以避免后续计算时的 Shared Memory Bank Conflicts
-    __shared__ float shared_x[BLOCK_SIZE];
-    __shared__ float shared_y[BLOCK_SIZE];
-    __shared__ float shared_z[BLOCK_SIZE];
-
-    // 计算需要分多少个 Tile
-    int num_tiles = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    // 3. Tiling 循环，每次加载 BLOCK_SIZE 个点到共享内存
-    for (int t = 0; t < num_tiles; ++t) {
-        int load_idx = t * BLOCK_SIZE + tx;
-
-        // 协作加载点数据到共享内存
-        if (load_idx < N) {
-            shared_x[tx] = points[load_idx * 3];
-            shared_y[tx] = points[load_idx * 3 + 1];
-            shared_z[tx] = points[load_idx * 3 + 2];
-        }
-        
-        // 屏障同步：确保当前 Tile 的所有点都已加载完毕
-        __syncthreads();
-
-        // 4. 计算当前目标点与当前 Tile 中所有点的距离
-        if (idx < N) {
-            // 处理最后一个可能不满的 Tile
-            int limit = min(BLOCK_SIZE, N - t * BLOCK_SIZE);
-            
-            #pragma unroll
-            for (int j = 0; j < limit; ++j) {
-                int global_j = t * BLOCK_SIZE + j;
-                
-                // 排除自己与自己的比较
-                if (global_j != idx) {
-                    float dx = target_x - shared_x[j];
-                    float dy = target_y - shared_y[j];
-                    float dz = target_z - shared_z[j];
-                    float dist = dx * dx + dy * dy + dz * dz;
-
-                    if (dist < min_dist) {
-                        min_dist = dist;
-                        best_idx = global_j;
-                    }
-                }
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float od = sDist[tid + s];
+            int   oi = sIdx[tid + s];
+            // 距离更小，或距离相等但下标更小 → 更新
+            if (od < sDist[tid] || (od == sDist[tid] && oi < sIdx[tid])) {
+                sDist[tid] = od;
+                sIdx[tid]  = oi;
             }
         }
-        
-        // 屏障同步：确保所有线程都计算完毕，然后再进入下一个循环覆盖共享内存
         __syncthreads();
     }
 
-    // 5. 将结果写回全局内存
-    if (idx < N) {
-        indices[idx] = best_idx;
-    }
+    if (tid == 0) indices[i] = sIdx[0];
 }
 
-// 供外部调用的接口
 extern "C" void solve(const float* points, int* indices, int N) {
-    if (N <= 1) return; // 边界情况保护
-
-    int threads = BLOCK_SIZE;
-    int blocks = (N + threads - 1) / threads;
-
-    // 启动 Kernel
-    nearestNeighborKernel<<<blocks, threads>>>(points, indices, N);
-    
-    // 注意：LeetGPU 平台通常会在底层隐式调用 cudaDeviceSynchronize() 并测时，
-    // 在这里调用 Kernel 即可。
+    int threads = 256;
+    int blocks = N;              // 一个 block 负责一个点
+    nearest<<<blocks, threads>>>(points, indices, N);
 }
