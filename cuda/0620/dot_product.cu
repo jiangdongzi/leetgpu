@@ -1,0 +1,30 @@
+#include <algorithm>
+#include <cuda_runtime.h>
+
+__global__ void dot_kernal(const float* A, const float* B, const int N, float* result) {
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    float local_sum = 0.f;
+    for (int i = gtid; i < N; i += stride) {
+        local_sum += A[i] * B[i];
+    }
+    __shared__ float sm[1024];
+    const int tid = threadIdx.x;
+    sm[tid] = local_sum;
+    __syncthreads();
+    for (int offset = 1024 / 2; offset > 0; offset /= 2) {
+        if (tid < offset) {
+            sm[tid] += sm[tid + offset];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        atomicAdd(result, sm[0]);
+    }
+}
+
+// A, B, result are device pointers
+extern "C" void solve(const float* A, const float* B, float* result, int N) {
+    const int blocks = std::min(1024, (N + 1023) / 1024);
+    dot_kernal<<<blocks, 1024>>>(A, B, N, result);
+}
